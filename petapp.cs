@@ -229,8 +229,8 @@ namespace ZhuChong
                 int layerCount = Math.Min(perLayer, n - layer * perLayer);
                 if (layerCount <= 0) break;
 
-                double angMin = -70 * Math.PI / 180;
-                double angMax = 70 * Math.PI / 180;
+                double angMin = -pet.RingSpan * Math.PI / 180;
+                double angMax = pet.RingSpan * Math.PI / 180;
                 double ang;
                 if (layerCount == 1)
                 {
@@ -1134,6 +1134,7 @@ namespace ZhuChong
         public int IconSize = 48;             // 图标尺寸
         public int RingBase = 150;            // 扇形基准半径
         public int RingGap = 100;             // 层距
+        public int RingSpan = 70;             // 图标角度跨度（度，越大越散开）
         public int RingCyAdj = 0;             // 圆心垂直调整
         public int RingCxAdj = 0;             // 圆心水平调整
         public int AudioVizCx = 0;            // 音频波形水平偏移
@@ -1410,6 +1411,7 @@ namespace ZhuChong
                 IconSize = IntXml(root, "iconSize", 48);
                 RingBase = IntXml(root, "ringBase", 150);
                 RingGap = IntXml(root, "ringGap", 100);
+                RingSpan = IntXml(root, "ringSpan", 70);
                 RingCyAdj = IntXml(root, "ringCyAdj", 0);
                 RingCxAdj = IntXml(root, "ringCxAdj", 0);
                 AudioVizCx = IntXml(root, "audioVizCx", 0);
@@ -1497,6 +1499,7 @@ namespace ZhuChong
                 AppendXml(root, "iconSize", IconSize.ToString());
                 AppendXml(root, "ringBase", RingBase.ToString());
                 AppendXml(root, "ringGap", RingGap.ToString());
+                AppendXml(root, "ringSpan", RingSpan.ToString());
                 AppendXml(root, "ringCyAdj", RingCyAdj.ToString());
                 AppendXml(root, "ringCxAdj", RingCxAdj.ToString());
                 AppendXml(root, "audioVizCx", AudioVizCx.ToString());
@@ -3277,19 +3280,19 @@ namespace ZhuChong
         RadioButton rbIdle, rbSit, rbRead, rbWalk;
         CheckBox chkWalk, chkClock;
         TrackBar tbScale, tbSpeed, tbBScale, tbBDepth, tbBOffset, tbBDur,
-                 tbIcon, tbRing, tbGap, tbCx, tbCy,
+                 tbIcon, tbRing, tbGap, tbSpan, tbCx, tbCy,
                  tbAudOut, tbAudIn, tbAudSpd, tbClockBr;
         ListBox lbLines;
         TextBox txtLine;
         Label lbScaleV, lbSpeedV, lbBScaleV, lbBDepthV, lbBOffsetV, lbBDurV,
-              lbIconV, lbRingV, lbGapV, lbCxV, lbCyV,
+              lbIconV, lbRingV, lbGapV, lbSpanV, lbCxV, lbCyV,
               lbAudOutV, lbAudInV, lbAudSpdV, lbClockBrV;
 
         public ControlPanelForm(PetForm owner)
         {
             pet = owner;
             Text = "桌宠控制面板";
-            ClientSize = new Size(470, 760);
+            ClientSize = new Size(470, 800);
             MinimumSize = new Size(430, 420);
             AutoScroll = true;
             FormBorderStyle = FormBorderStyle.Sizable;
@@ -3338,13 +3341,14 @@ namespace ZhuChong
             baseY += 80;
 
             // —— 快捷图标 ——
-            var gIcon = AddGroup("快捷图标", gx, baseY, gw, 214);
+            var gIcon = AddGroup("快捷图标", gx, baseY, gw, 252);
             AddRow(gIcon, "大小", out tbIcon, out lbIconV, 24, 28, 72, pet.IconSize);
             AddRow(gIcon, "半径", out tbRing, out lbRingV, 62, 100, 400, pet.RingBase);
             AddRow(gIcon, "层距", out tbGap, out lbGapV, 100, 30, 150, pet.RingGap);
-            AddRow(gIcon, "圆心X", out tbCx, out lbCxV, 138, -200, 200, pet.RingCxAdj);
-            AddRow(gIcon, "圆心Y", out tbCy, out lbCyV, 176, -120, 120, pet.RingCyAdj);
-            baseY += 234;
+            AddRow(gIcon, "图标间距", out tbSpan, out lbSpanV, 138, 30, 120, pet.RingSpan);
+            AddRow(gIcon, "圆心X", out tbCx, out lbCxV, 176, -200, 200, pet.RingCxAdj);
+            AddRow(gIcon, "圆心Y", out tbCy, out lbCyV, 214, -120, 120, pet.RingCyAdj);
+            baseY += 272;
 
             // —— 通用 ——
             var gGen = AddGroup("通用", gx, baseY, gw, 64);
@@ -3393,6 +3397,7 @@ namespace ZhuChong
             tbIcon.ValueChanged += (se, ea) => { pet.IconSize = tbIcon.Value; lbIconV.Text = tbIcon.Value.ToString(); pet.RebuildIcons(); pet.RingPreviewTip(); };
             tbRing.ValueChanged += (se, ea) => { pet.RingBase = tbRing.Value; lbRingV.Text = tbRing.Value.ToString(); pet.RebuildIcons(); pet.RingPreviewTip(); };
             tbGap.ValueChanged += (se, ea) => { pet.RingGap = tbGap.Value; lbGapV.Text = tbGap.Value.ToString(); pet.RebuildIcons(); pet.RingPreviewTip(); };
+            tbSpan.ValueChanged += (se, ea) => { pet.RingSpan = tbSpan.Value; lbSpanV.Text = tbSpan.Value.ToString() + "°"; pet.RebuildIcons(); pet.RingPreviewTip(); };
             tbCx.ValueChanged += (se, ea) => { pet.RingCxAdj = tbCx.Value; lbCxV.Text = tbCx.Value.ToString(); pet.RebuildIcons(); pet.RingPreviewTip(); };
             tbCy.ValueChanged += (se, ea) => { pet.RingCyAdj = tbCy.Value; lbCyV.Text = tbCy.Value.ToString(); pet.RebuildIcons(); pet.RingPreviewTip(); };
             tbAudOut.ValueChanged += (se, ea) => { pet.AudioOutAmp = tbAudOut.Value; lbAudOutV.Text = tbAudOut.Value.ToString() + "%"; };
@@ -3409,6 +3414,7 @@ namespace ZhuChong
             tbIcon.MouseUp += (se, ea) => pet.SaveConfig();
             tbRing.MouseUp += (se, ea) => pet.SaveConfig();
             tbGap.MouseUp += (se, ea) => pet.SaveConfig();
+            tbSpan.MouseUp += (se, ea) => pet.SaveConfig();
             tbCx.MouseUp += (se, ea) => pet.SaveConfig();
             tbCy.MouseUp += (se, ea) => pet.SaveConfig();
             tbAudOut.MouseUp += (se, ea) => pet.SaveConfig();
