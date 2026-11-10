@@ -1,4 +1,4 @@
-// 八重神子桌宠 - C# WinForms 单进程原生版
+﻿// 八重神子桌宠 - C# WinForms 单进程原生版
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -87,20 +87,6 @@ namespace ZhuChong
         public string Text;
         public bool Done;
         public TodoItem(string t, bool d) { Text = t; Done = d; }
-    }
-
-    // 拖拽缩放滑块实时预览时使用最近邻插值，防止 StretchImage 将品红透明底色混入边缘产生紫边
-    class CrispPictureBox : PictureBox
-    {
-        protected override void OnPaint(PaintEventArgs pe)
-        {
-            if (Image != null && (Width != Image.Width || Height != Image.Height))
-            {
-                pe.Graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
-                pe.Graphics.PixelOffsetMode = PixelOffsetMode.Half;
-            }
-            base.OnPaint(pe);
-        }
     }
 
     // =========================================================================
@@ -1174,7 +1160,7 @@ namespace ZhuChong
 
         Dictionary<string, GifClip> clips = new Dictionary<string, GifClip>();
         int frameIdx = 0;
-        Timer animTimer, walkTimer, clockTimer, idleTimer, scaleRebuildTimer;
+        Timer animTimer, walkTimer, clockTimer, idleTimer;
         int walkEndTick = 0;
         bool ringOpen = false;
         RingOverlayForm ringOverlay;
@@ -1232,7 +1218,7 @@ namespace ZhuChong
             DoubleBuffered = true;
 
             // 角色显示
-            petBox = new CrispPictureBox
+            petBox = new PictureBox
             {
                 BackColor = Color.Magenta,
                 Size = new Size(Nw, PetH),
@@ -1322,8 +1308,6 @@ namespace ZhuChong
 
             tomatoTimer = new Timer { Interval = 1000 };
             tomatoTimer.Tick += (s, e) => TomatoTick();
-
-
 
             // 全屏检测定时器
             fsTimer = new Timer { Interval = 500 };
@@ -1551,8 +1535,8 @@ namespace ZhuChong
             n.AppendChild(c);
         }
 
-        // ---------- GIF 加载与边缘半透明二值化（泛洪算法区分外部背景与角色内部，100% 根除透明流动噪点与空洞） ----------
-        static Bitmap KillSemiAlpha(Bitmap src, bool removeEdgeMatte)
+        // ---------- GIF 加载与边缘半透明二值化 ----------
+        static Bitmap KillSemiAlpha(Bitmap src)
         {
             int w = src.Width, h = src.Height;
             var dst = new Bitmap(w, h, PixelFormat.Format32bppArgb);
@@ -1560,209 +1544,48 @@ namespace ZhuChong
                 ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
             var dstData = dst.LockBits(new Rectangle(0, 0, w, h),
                 ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
-            int stride = srcData.Stride;
-            int bytes = stride * h;
-            var srcBuf = new byte[bytes];
-            var dstBuf = new byte[bytes];
-            Marshal.Copy(srcData.Scan0, srcBuf, 0, bytes);
-
-            // 1. 使用四向广度优先搜索 (BFS) 从图片四条边界向内泛洪探测真正的外部透明背景
-            // 只有能连通到画面四周边缘的半透明区域才是背景！
-            // 角色身体内部（暗部阴影、头发褶皱、衣服缝隙）被误标记为透明色的所有独立孔洞都不会连通到外部，100% 精确识别
-            bool[] isOuterBg = new bool[w * h];
-            int[] queue = new int[w * h];
-            int qHead = 0, qTail = 0;
-
-            for (int x = 0; x < w; x++)
-            {
-                int topIdx = x;
-                if (srcBuf[topIdx * 4 + 3] < 180)
-                {
-                    isOuterBg[topIdx] = true;
-                    queue[qTail++] = topIdx;
-                }
-                int btmIdx = (h - 1) * w + x;
-                int btmByte = (h - 1) * stride + x * 4;
-                if (!isOuterBg[btmIdx] && srcBuf[btmByte + 3] < 180)
-                {
-                    isOuterBg[btmIdx] = true;
-                    queue[qTail++] = btmIdx;
-                }
-            }
+            int bytes = srcData.Stride * h;
+            var buf = new byte[bytes];
+            Marshal.Copy(srcData.Scan0, buf, 0, bytes);
             for (int y = 0; y < h; y++)
             {
-                int leftIdx = y * w;
-                int leftByte = y * stride;
-                if (!isOuterBg[leftIdx] && srcBuf[leftByte + 3] < 180)
-                {
-                    isOuterBg[leftIdx] = true;
-                    queue[qTail++] = leftIdx;
-                }
-                int rightIdx = y * w + (w - 1);
-                int rightByte = y * stride + (w - 1) * 4;
-                if (!isOuterBg[rightIdx] && srcBuf[rightByte + 3] < 180)
-                {
-                    isOuterBg[rightIdx] = true;
-                    queue[qTail++] = rightIdx;
-                }
-            }
-
-            while (qHead < qTail)
-            {
-                int curr = queue[qHead++];
-                int cy = curr / w;
-                int cx = curr % w;
-
-                // 4 邻域扩散
-                if (cy > 0)
-                {
-                    int nIdx = (cy - 1) * w + cx;
-                    if (!isOuterBg[nIdx] && srcBuf[(cy - 1) * stride + cx * 4 + 3] < 180)
-                    {
-                        isOuterBg[nIdx] = true;
-                        queue[qTail++] = nIdx;
-                    }
-                }
-                if (cy < h - 1)
-                {
-                    int nIdx = (cy + 1) * w + cx;
-                    if (!isOuterBg[nIdx] && srcBuf[(cy + 1) * stride + cx * 4 + 3] < 180)
-                    {
-                        isOuterBg[nIdx] = true;
-                        queue[qTail++] = nIdx;
-                    }
-                }
-                if (cx > 0)
-                {
-                    int nIdx = cy * w + (cx - 1);
-                    if (!isOuterBg[nIdx] && srcBuf[cy * stride + (cx - 1) * 4 + 3] < 180)
-                    {
-                        isOuterBg[nIdx] = true;
-                        queue[qTail++] = nIdx;
-                    }
-                }
-                if (cx < w - 1)
-                {
-                    int nIdx = cy * w + (cx + 1);
-                    if (!isOuterBg[nIdx] && srcBuf[cy * stride + (cx + 1) * 4 + 3] < 180)
-                    {
-                        isOuterBg[nIdx] = true;
-                        queue[qTail++] = nIdx;
-                    }
-                }
-            }
-
-            // 2. 像素转换与内部孔洞修补
-            for (int y = 0; y < h; y++)
-            {
-                int row = y * stride;
-                int pRow = y * w;
+                int row = y * srcData.Stride;
                 for (int x = 0; x < w; x++)
                 {
                     int i = row + x * 4;
-                    int pi = pRow + x;
-
-                    if (isOuterBg[pi])
+                    byte a = buf[i + 3];
+                    byte r = buf[i + 2], g = buf[i + 1], b = buf[i];
+                    bool edgeNoise = false;
+                    // 只删真正纯白的噪点（RGB都很高），浅灰色头发不删
+                    if (a == 255 && r > 225 && g > 225 && b > 225)
                     {
-                        // 真正的外部背景 -> 设为品红透明色 (255, 0, 255)
-                        dstBuf[i] = 255;
-                        dstBuf[i + 1] = 0;
-                        dstBuf[i + 2] = 255;
-                        dstBuf[i + 3] = 255;
-                        continue;
-                    }
-
-                    byte a = srcBuf[i + 3];
-                    byte r = srcBuf[i + 2], g = srcBuf[i + 1], b = srcBuf[i];
-
-                    if (a < 180)
-                    {
-                        // 核心修复：角色内部的透明流动噪点/孔洞（因 GIF 调色板把深色勾线误设为透明色）
-                        // 自动寻找周围不透明像素进行修补填充，彻底消除透明空洞！
-                        int opCount = 0;
-                        int sumR = 0, sumG = 0, sumB = 0;
-                        for (int dy = -2; dy <= 2; dy++)
-                        {
-                            int ny = y + dy;
-                            if (ny < 0 || ny >= h) continue;
-                            int nrow = ny * stride;
-                            int npRow = ny * w;
-                            for (int dx = -2; dx <= 2; dx++)
-                            {
-                                if (dx == 0 && dy == 0) continue;
-                                int nx = x + dx;
-                                if (nx < 0 || nx >= w) continue;
-                                if (!isOuterBg[npRow + nx] && srcBuf[nrow + nx * 4 + 3] >= 180)
-                                {
-                                    opCount++;
-                                    sumB += srcBuf[nrow + nx * 4];
-                                    sumG += srcBuf[nrow + nx * 4 + 1];
-                                    sumR += srcBuf[nrow + nx * 4 + 2];
-                                }
-                            }
-                        }
-                        if (opCount > 0)
-                        {
-                            byte fillR = (byte)(sumR / opCount);
-                            byte fillG = (byte)(sumG / opCount);
-                            byte fillB = (byte)(sumB / opCount);
-                            if (fillR == 255 && fillG == 0 && fillB == 255) fillB = 254;
-                            dstBuf[i] = fillB;
-                            dstBuf[i + 1] = fillG;
-                            dstBuf[i + 2] = fillR;
-                            dstBuf[i + 3] = 255;
-                        }
-                        else
-                        {
-                            // 极深凹陷内部阴影：默认填入深紫色勾线阴影色
-                            dstBuf[i] = 45;
-                            dstBuf[i + 1] = 30;
-                            dstBuf[i + 2] = 40;
-                            dstBuf[i + 3] = 255;
-                        }
-                        continue;
-                    }
-
-                    // 对于外圈边缘的白边/亮粉色锯齿像素：只有直接与真正外部背景相邻且达到杂色条件时才消除
-                    bool isOuterEdgeMatte = false;
-                    if (removeEdgeMatte && ((r > 225 && g > 225 && b > 225) || (r > 180 && b > 180 && g < 160 && Math.Abs(r - b) < 60)))
-                    {
-                        int bgNeighbors = 0;
+                        int transparentCount = 0;
                         for (int dy = -1; dy <= 1; dy++)
                         {
-                            int ny = y + dy;
-                            if (ny < 0 || ny >= h) { bgNeighbors++; continue; }
-                            int npRow = ny * w;
                             for (int dx = -1; dx <= 1; dx++)
                             {
                                 if (dx == 0 && dy == 0) continue;
-                                int nx = x + dx;
-                                if (nx < 0 || nx >= w) { bgNeighbors++; continue; }
-                                if (isOuterBg[npRow + nx]) bgNeighbors++;
+                                int ny = y + dy, nx = x + dx;
+                                if (ny < 0 || ny >= h || nx < 0 || nx >= w) continue;
+                                int j = ny * srcData.Stride + nx * 4;
+                                if (buf[j] == 255 && buf[j+1] == 0 && buf[j+2] == 255) transparentCount++;
                             }
                         }
-                        if (bgNeighbors >= 3) isOuterEdgeMatte = true;
+                        // 纯白噪点：8邻域至少3个透明邻居才算（不要误删头发）
+                        if (transparentCount >= 3) edgeNoise = true;
                     }
-
-                    if (isOuterEdgeMatte)
+                    bool isPinkEdge = r > 180 && b > 180 && g < 180 && Math.Abs(r - b) < 60;
+                    if (a < 160 || edgeNoise || isPinkEdge)
                     {
-                        dstBuf[i] = 255;
-                        dstBuf[i + 1] = 0;
-                        dstBuf[i + 2] = 255;
-                        dstBuf[i + 3] = 255;
+                        buf[i] = 255; buf[i + 1] = 0; buf[i + 2] = 255; buf[i + 3] = 255;
                     }
-                    else
+                    else if (a != 255)
                     {
-                        // 确保内部正常显示的像素不会巧合为品红 (255, 0, 255) 被窗体透明键挖穿
-                        if (r == 255 && g == 0 && b == 255) b = 254;
-                        dstBuf[i] = b;
-                        dstBuf[i + 1] = g;
-                        dstBuf[i + 2] = r;
-                        dstBuf[i + 3] = 255;
+                        buf[i + 3] = 255;
                     }
                 }
             }
-            Marshal.Copy(dstBuf, 0, dstData.Scan0, bytes);
+            Marshal.Copy(buf, 0, dstData.Scan0, bytes);
             src.UnlockBits(srcData);
             dst.UnlockBits(dstData);
             return dst;
@@ -1843,16 +1666,18 @@ namespace ZhuChong
                             var scaled = new Bitmap(dw, dh, PixelFormat.Format32bppArgb);
                             using (var g = Graphics.FromImage(scaled))
                             {
-                                // 缩放前清空为全透明 Color.Transparent，避免 Color.Magenta 混入半透明边缘
-                                g.Clear(Color.Transparent);
+                                g.Clear(Color.Magenta);
                                 g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                                g.SmoothingMode = SmoothingMode.HighQuality;
                                 g.PixelOffsetMode = PixelOffsetMode.HighQuality;
                                 g.DrawImage(img, 0, 0, dw, dh);
                             }
-                            var clean = KillSemiAlpha(scaled, outlineOn);
-                            scaled.Dispose();
-                            clip.Frames.Add(clean);
+                            if (outlineOn)
+                            {
+                                var clean = KillSemiAlpha(scaled);
+                                scaled.Dispose();
+                                scaled = clean;
+                            }
+                            clip.Frames.Add(scaled);
 
                             int d = 100;
                             if (delayBytes != null && delayBytes.Length >= (i + 1) * 4)
@@ -1909,16 +1734,10 @@ namespace ZhuChong
             if (petBox != null)
             {
                 petBox.Image = bmp;
-                int dh = PetH;
-                int dw = Math.Max(10, (int)((long)bmp.Width * dh / Math.Max(1, bmp.Height)));
-                if (petBox.Width != dw || petBox.Height != dh)
+                if (petBox.Width != bmp.Width || petBox.Height != bmp.Height)
                 {
-                    petBox.Size = new Size(dw, dh);
-                }
-                Point targetLoc = new Point((Nw - dw) / 2, FootY - dh);
-                if (petBox.Location != targetLoc)
-                {
-                    petBox.Location = targetLoc;
+                    petBox.Size = new Size(bmp.Width, bmp.Height);
+                    petBox.Location = new Point((Nw - bmp.Width) / 2, FootY - bmp.Height);
                 }
             }
 
@@ -3370,7 +3189,6 @@ namespace ZhuChong
                 if (clockTimer != null) { clockTimer.Dispose(); clockTimer = null; }
                 if (idleTimer != null) { idleTimer.Dispose(); idleTimer = null; }
                 if (tomatoTimer != null) { tomatoTimer.Dispose(); tomatoTimer = null; }
-
                 if (fsTimer != null) { fsTimer.Dispose(); fsTimer = null; }
                 if (autoTimer != null) { autoTimer.Dispose(); autoTimer = null; }
                 if (updateTimer != null) { updateTimer.Dispose(); updateTimer = null; }
@@ -3438,8 +3256,7 @@ namespace ZhuChong
 
             if (ringOpen && ringOverlay != null && !ringOverlay.IsDisposed)
             {
-                ringOverlay.SyncToPet();
-                ringOverlay.RebuildIcons();
+                ringOverlay.ShowRing();
             }
             if (audioVizOn && audioViz != null && !audioViz.IsDisposed && audioViz.Visible)
             {
@@ -3571,9 +3388,7 @@ namespace ZhuChong
             chkWalk.CheckedChanged += (se, ea) => { pet.WalkEnabled = chkWalk.Checked; pet.SaveConfig(); };
             chkClock.CheckedChanged += (se, ea) => pet.ToggleClockPub();
 
-            tbScale.ValueChanged += (se, ea) => { lbScaleV.Text = tbScale.Value.ToString() + "%"; };
-            tbScale.MouseUp += (se, ea) => { pet.SetPetScale(tbScale.Value / 100.0); pet.SaveConfig(); };
-            tbScale.KeyUp += (se, ea) => { pet.SetPetScale(tbScale.Value / 100.0); pet.SaveConfig(); };
+            tbScale.ValueChanged += (se, ea) => { pet.SetPetScale(tbScale.Value / 100.0); lbScaleV.Text = tbScale.Value.ToString() + "%"; };
             tbSpeed.ValueChanged += (se, ea) => { pet.WalkSpeed = tbSpeed.Value; lbSpeedV.Text = tbSpeed.Value.ToString(); };
             tbBScale.ValueChanged += (se, ea) => { pet.BubbleScale = tbBScale.Value / 100.0; lbBScaleV.Text = tbBScale.Value.ToString() + "%"; pet.RedrawBubble(); };
             tbBDepth.ValueChanged += (se, ea) => { pet.BubbleDepth = tbBDepth.Value; lbBDepthV.Text = tbBDepth.Value.ToString(); pet.RedrawBubble(); };
@@ -3590,7 +3405,7 @@ namespace ZhuChong
             tbAudSpd.ValueChanged += (se, ea) => { pet.AudioSpeed = tbAudSpd.Value; lbAudSpdV.Text = tbAudSpd.Value.ToString() + "%"; };
             tbClockBr.ValueChanged += (se, ea) => { pet.ClockBrightness = tbClockBr.Value; lbClockBrV.Text = tbClockBr.Value.ToString() + "%"; pet.UpdateClock(); };
             // 鼠标松开滑块时写盘，避免拖动过程频繁 I/O
-// tbScale.MouseUp handled above
+            tbScale.MouseUp += (se, ea) => pet.SaveConfig();
             tbSpeed.MouseUp += (se, ea) => pet.SaveConfig();
             tbBScale.MouseUp += (se, ea) => pet.SaveConfig();
             tbBDepth.MouseUp += (se, ea) => pet.SaveConfig();
