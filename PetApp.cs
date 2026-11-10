@@ -1560,7 +1560,7 @@ namespace ZhuChong
             n.AppendChild(c);
         }
 
-        // ---------- GIF 加载与边缘半透明二值化（泛洪算法区分外部背景与角色内部，100% 根除透明流动噪点与空洞） ----------
+        // ---------- GIF 加载与边缘半透明二值化（反预乘还原真实原色 + 泛洪去黑点噪点） ----------
         static Bitmap KillSemiAlpha(Bitmap src, bool removeEdgeMatte)
         {
             int w = src.Width, h = src.Height;
@@ -1575,9 +1575,9 @@ namespace ZhuChong
             var dstBuf = new byte[bytes];
             Marshal.Copy(srcData.Scan0, srcBuf, 0, bytes);
 
-            // 1. 使用四向广度优先搜索 (BFS) 从图片四条边界向内泛洪探测真正的外部透明背景
-            // 阈值设为 85：精确保留迈腿与边缘细腻的抗锯齿半透明过度像素，消除走动迈步时的毛刺与锯齿；
-            // 同时身体内部独立封闭的黑色/深色孔洞不与外部连通，100% 自动修补！
+            // 1. 使用四向广度优先搜索 (BFS) 从四条边界向内泛洪探测真正的外部透明背景
+            // 阈值设为 128：既能保证边缘过渡平滑无毛刺，又能精准切除与黑色背景混合的半透明浮灰
+            const int ALPHA_THRESH = 128;
             bool[] isOuterBg = new bool[w * h];
             int[] queue = new int[w * h];
             int qHead = 0, qTail = 0;
@@ -1585,14 +1585,14 @@ namespace ZhuChong
             for (int x = 0; x < w; x++)
             {
                 int topIdx = x;
-                if (srcBuf[topIdx * 4 + 3] < 85)
+                if (srcBuf[topIdx * 4 + 3] < ALPHA_THRESH)
                 {
                     isOuterBg[topIdx] = true;
                     queue[qTail++] = topIdx;
                 }
                 int btmIdx = (h - 1) * w + x;
                 int btmByte = (h - 1) * stride + x * 4;
-                if (!isOuterBg[btmIdx] && srcBuf[btmByte + 3] < 85)
+                if (!isOuterBg[btmIdx] && srcBuf[btmByte + 3] < ALPHA_THRESH)
                 {
                     isOuterBg[btmIdx] = true;
                     queue[qTail++] = btmIdx;
@@ -1602,14 +1602,14 @@ namespace ZhuChong
             {
                 int leftIdx = y * w;
                 int leftByte = y * stride;
-                if (!isOuterBg[leftIdx] && srcBuf[leftByte + 3] < 85)
+                if (!isOuterBg[leftIdx] && srcBuf[leftByte + 3] < ALPHA_THRESH)
                 {
                     isOuterBg[leftIdx] = true;
                     queue[qTail++] = leftIdx;
                 }
                 int rightIdx = y * w + (w - 1);
                 int rightByte = y * stride + (w - 1) * 4;
-                if (!isOuterBg[rightIdx] && srcBuf[rightByte + 3] < 85)
+                if (!isOuterBg[rightIdx] && srcBuf[rightByte + 3] < ALPHA_THRESH)
                 {
                     isOuterBg[rightIdx] = true;
                     queue[qTail++] = rightIdx;
@@ -1626,7 +1626,7 @@ namespace ZhuChong
                 if (cy > 0)
                 {
                     int nIdx = (cy - 1) * w + cx;
-                    if (!isOuterBg[nIdx] && srcBuf[(cy - 1) * stride + cx * 4 + 3] < 85)
+                    if (!isOuterBg[nIdx] && srcBuf[(cy - 1) * stride + cx * 4 + 3] < ALPHA_THRESH)
                     {
                         isOuterBg[nIdx] = true;
                         queue[qTail++] = nIdx;
@@ -1635,7 +1635,7 @@ namespace ZhuChong
                 if (cy < h - 1)
                 {
                     int nIdx = (cy + 1) * w + cx;
-                    if (!isOuterBg[nIdx] && srcBuf[(cy + 1) * stride + cx * 4 + 3] < 85)
+                    if (!isOuterBg[nIdx] && srcBuf[(cy + 1) * stride + cx * 4 + 3] < ALPHA_THRESH)
                     {
                         isOuterBg[nIdx] = true;
                         queue[qTail++] = nIdx;
@@ -1644,7 +1644,7 @@ namespace ZhuChong
                 if (cx > 0)
                 {
                     int nIdx = cy * w + (cx - 1);
-                    if (!isOuterBg[nIdx] && srcBuf[cy * stride + (cx - 1) * 4 + 3] < 85)
+                    if (!isOuterBg[nIdx] && srcBuf[cy * stride + (cx - 1) * 4 + 3] < ALPHA_THRESH)
                     {
                         isOuterBg[nIdx] = true;
                         queue[qTail++] = nIdx;
@@ -1653,7 +1653,7 @@ namespace ZhuChong
                 if (cx < w - 1)
                 {
                     int nIdx = cy * w + (cx + 1);
-                    if (!isOuterBg[nIdx] && srcBuf[cy * stride + (cx + 1) * 4 + 3] < 85)
+                    if (!isOuterBg[nIdx] && srcBuf[cy * stride + (cx + 1) * 4 + 3] < ALPHA_THRESH)
                     {
                         isOuterBg[nIdx] = true;
                         queue[qTail++] = nIdx;
@@ -1661,7 +1661,7 @@ namespace ZhuChong
                 }
             }
 
-            // 2. 像素转换与内部孔洞修补
+            // 2. 像素转换：反预乘还原真实颜色，并彻底修补角色内部孔洞
             for (int y = 0; y < h; y++)
             {
                 int row = y * stride;
@@ -1684,10 +1684,9 @@ namespace ZhuChong
                     byte a = srcBuf[i + 3];
                     byte r = srcBuf[i + 2], g = srcBuf[i + 1], b = srcBuf[i];
 
-                    if (a < 85)
+                    if (a < ALPHA_THRESH)
                     {
-                        // 核心修复：角色内部的透明流动噪点/孔洞（因 GIF 调色板把深色勾线误设为透明色）
-                        // 自动寻找周围不透明像素进行修补填充，彻底消除透明空洞！
+                        // 角色内部封闭孔洞：自动寻找周围不透明像素进行修补填充
                         int opCount = 0;
                         int sumR = 0, sumG = 0, sumB = 0;
                         for (int dy = -2; dy <= 2; dy++)
@@ -1701,7 +1700,7 @@ namespace ZhuChong
                                 if (dx == 0 && dy == 0) continue;
                                 int nx = x + dx;
                                 if (nx < 0 || nx >= w) continue;
-                                if (!isOuterBg[npRow + nx] && srcBuf[nrow + nx * 4 + 3] >= 85)
+                                if (!isOuterBg[npRow + nx] && srcBuf[nrow + nx * 4 + 3] >= ALPHA_THRESH)
                                 {
                                     opCount++;
                                     sumB += srcBuf[nrow + nx * 4];
@@ -1723,7 +1722,6 @@ namespace ZhuChong
                         }
                         else
                         {
-                            // 极深凹陷内部阴影：默认填入深紫色勾线阴影色
                             dstBuf[i] = 45;
                             dstBuf[i + 1] = 30;
                             dstBuf[i + 2] = 40;
@@ -1732,9 +1730,21 @@ namespace ZhuChong
                         continue;
                     }
 
-                    // 对于外圈边缘的白边/亮粉色锯齿像素：只有直接与真正外部背景相邻且达到杂色条件时才消除
+                    // 核心修复：双三次插值缩放时，边缘半透明像素会与原图透明底色 (RGB: 0,0,0) 预乘混合导致发黑变暗。
+                    // 只要反预乘 (Un-premultiply) 还原出原始明亮色彩，边缘原本的发色/肤色就能100%纯净呈现，黑点彻底消失！
+                    int curB = b;
+                    int curG = g;
+                    int curR = r;
+                    if (a > 0 && a < 255)
+                    {
+                        curB = Math.Min(255, (b * 255) / a);
+                        curG = Math.Min(255, (g * 255) / a);
+                        curR = Math.Min(255, (r * 255) / a);
+                    }
+
+                    // 对于外圈边缘的白边/亮粉色锯齿像素进行消除
                     bool isOuterEdgeMatte = false;
-                    if (removeEdgeMatte && ((r > 225 && g > 225 && b > 225) || (r > 180 && b > 180 && g < 160 && Math.Abs(r - b) < 60)))
+                    if (removeEdgeMatte && ((curR > 225 && curG > 225 && curB > 225) || (curR > 180 && curB > 180 && curG < 160 && Math.Abs(curR - curB) < 60)))
                     {
                         int bgNeighbors = 0;
                         for (int dy = -1; dy <= 1; dy++)
@@ -1763,10 +1773,10 @@ namespace ZhuChong
                     else
                     {
                         // 确保内部正常显示的像素不会巧合为品红 (255, 0, 255) 被窗体透明键挖穿
-                        if (r == 255 && g == 0 && b == 255) b = 254;
-                        dstBuf[i] = b;
-                        dstBuf[i + 1] = g;
-                        dstBuf[i + 2] = r;
+                        if (curR == 255 && curG == 0 && curB == 255) curB = 254;
+                        dstBuf[i] = (byte)curB;
+                        dstBuf[i + 1] = (byte)curG;
+                        dstBuf[i + 2] = (byte)curR;
                         dstBuf[i + 3] = 255;
                     }
                 }
