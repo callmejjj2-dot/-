@@ -1081,8 +1081,8 @@ namespace ZhuChong
                 return;
             }
             pe.Graphics.Clear(BackColor);
-            pe.Graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
-            pe.Graphics.PixelOffsetMode = PixelOffsetMode.Half;
+            pe.Graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            pe.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
             pe.Graphics.DrawImage(Image, ClientRectangle);
         }
     }
@@ -1132,6 +1132,7 @@ namespace ZhuChong
         bool isCheckingUpdate = false;
         // 自动动作检测
         Timer autoTimer;
+        Timer scaleDebounceTimer;
         IntPtr kbHook = IntPtr.Zero;
         LowLevelKeyboardProc kbProc;
         DateTime lastKeyTime = DateTime.MinValue;
@@ -1220,6 +1221,13 @@ namespace ZhuChong
             cfgPath = Path.Combine(cfgDir, "config.xml");
 
             LoadConfig();
+                        scaleDebounceTimer = new Timer { Interval = 350 };
+            scaleDebounceTimer.Tick += (se, ea) =>
+            {
+                scaleDebounceTimer.Stop();
+                LoadGifs();
+                PlayFrame();
+            };
             LoadGifs();
 
             // 窗体
@@ -1554,60 +1562,51 @@ namespace ZhuChong
             n.AppendChild(c);
         }
 
-        // ---------- GIF 加载与边缘半透明二值化 ----------
-        static Bitmap KillSemiAlpha(Bitmap src)
+                // ---------- 高清抗锯齿帧边缘净化（彻底杜绝洋红渗色、黑点噪点与马赛克） ----------
+        static void CleanBicubicFrame(Bitmap bmp)
         {
-            int w = src.Width, h = src.Height;
-            var dst = new Bitmap(w, h, PixelFormat.Format32bppArgb);
-            var srcData = src.LockBits(new Rectangle(0, 0, w, h),
-                ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-            var dstData = dst.LockBits(new Rectangle(0, 0, w, h),
-                ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
-            int bytes = srcData.Stride * h;
+            int w = bmp.Width, h = bmp.Height;
+            var data = bmp.LockBits(new Rectangle(0, 0, w, h),
+                ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
+            int bytes = data.Stride * h;
             var buf = new byte[bytes];
-            Marshal.Copy(srcData.Scan0, buf, 0, bytes);
+            Marshal.Copy(data.Scan0, buf, 0, bytes);
+
             for (int y = 0; y < h; y++)
             {
-                int row = y * srcData.Stride;
+                int row = y * data.Stride;
                 for (int x = 0; x < w; x++)
                 {
                     int i = row + x * 4;
                     byte a = buf[i + 3];
-                    byte r = buf[i + 2], g = buf[i + 1], b = buf[i];
-                    bool edgeNoise = false;
-                    // 只删真正纯白的噪点（RGB都很高），浅灰色头发不删
-                    if (a == 255 && r > 225 && g > 225 && b > 225)
+                    if (a < 120)
                     {
-                        int transparentCount = 0;
-                        for (int dy = -1; dy <= 1; dy++)
+                        // 彻底置为纯洋红 (255, 0, 255)，供 Windows TransparencyKey 100% 精确穿透，绝不留半点洋红描边
+                        buf[i] = 255;     // B
+                        buf[i + 1] = 0;   // G
+                        buf[i + 2] = 255; // R
+                        buf[i + 3] = 255; // A
+                    }
+                    else
+                    {
+                        // 逆预乘 Alpha 恢复角色边缘真实色彩，消除双三次插值边缘采样黑色产生的暗斑与黑点
+                        if (a < 255 && a > 0)
                         {
-                            for (int dx = -1; dx <= 1; dx++)
-                            {
-                                if (dx == 0 && dy == 0) continue;
-                                int ny = y + dy, nx = x + dx;
-                                if (ny < 0 || ny >= h || nx < 0 || nx >= w) continue;
-                                int j = ny * srcData.Stride + nx * 4;
-                                if (buf[j] == 255 && buf[j+1] == 0 && buf[j+2] == 255) transparentCount++;
-                            }
+                            int invA = 255 * 255 / a;
+                            int b = (buf[i] * invA) / 255;
+                            int g = (buf[i + 1] * invA) / 255;
+                            int r = (buf[i + 2] * invA) / 255;
+                            buf[i] = (byte)(b > 255 ? 255 : b);
+                            buf[i + 1] = (byte)(g > 255 ? 255 : g);
+                            buf[i + 2] = (byte)(r > 255 ? 255 : r);
                         }
-                        // 纯白噪点：8邻域至少3个透明邻居才算（不要误删头发）
-                        if (transparentCount >= 3) edgeNoise = true;
-                    }
-                    bool isPinkEdge = r > 180 && b > 180 && g < 180 && Math.Abs(r - b) < 60;
-                    if (a < 160 || edgeNoise || isPinkEdge)
-                    {
-                        buf[i] = 255; buf[i + 1] = 0; buf[i + 2] = 255; buf[i + 3] = 255;
-                    }
-                    else if (a != 255)
-                    {
                         buf[i + 3] = 255;
                     }
                 }
             }
-            Marshal.Copy(buf, 0, dstData.Scan0, bytes);
-            src.UnlockBits(srcData);
-            dst.UnlockBits(dstData);
-            return dst;
+
+            Marshal.Copy(buf, 0, data.Scan0, bytes);
+            bmp.UnlockBits(data);
         }
 
         void LoadGifs()
@@ -1676,12 +1675,22 @@ namespace ZhuChong
                         }
                         catch { }
 
+                        int dh = targetH;
+                        int dw = Math.Max(10, (int)((long)img.Width * dh / img.Height));
                         var clip = new GifClip();
                         for (int i = 0; i < n; i++)
                         {
                             img.SelectActiveFrame(dim, i);
-                            // 直接使用原图透明通道帧，绝不进行二次采样与边缘阈值破坏，杜绝黑点、噪点与发丝空洞
-                            clip.Frames.Add(new Bitmap(img));
+                            var scaled = new Bitmap(dw, dh, PixelFormat.Format32bppArgb);
+                            using (var g = Graphics.FromImage(scaled))
+                            {
+                                g.Clear(Color.Transparent);
+                                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                                g.DrawImage(img, 0, 0, dw, dh);
+                            }
+                            CleanBicubicFrame(scaled);
+                            clip.Frames.Add(scaled);
 
                             int d = 100;
                             if (delayBytes != null && delayBytes.Length >= (i + 1) * 4)
@@ -3214,11 +3223,21 @@ namespace ZhuChong
             int nw = Nw, nh = Nh;
             int y = oldFootScreen - FootY;
             SetBounds(Location.X + (Width - nw) / 2, y, nw, nh);
-            // 实时拖拽缩放时直接调整显示比例，零延迟，完全无需重载300+帧GIF，彻底告别卡顿
-            PlayFrame();
-            if (petBox != null) petBox.Location = new Point((nw - petBox.Width) / 2, FootY - petBox.Height);
+            // 实时拖拽缩放即时更新PictureBox尺寸（60FPS丝滑无卡顿）
+            if (petBox != null && petBox.Image != null)
+            {
+                int targetH = PetH;
+                int targetW = Math.Max(10, (int)((long)petBox.Image.Width * targetH / petBox.Image.Height));
+                petBox.Size = new Size(targetW, targetH);
+                petBox.Location = new Point((nw - targetW) / 2, FootY - targetH);
+            }
             clockLabel.Location = new Point(nw / 2, FootY + 2);
             tomatoLabel.Location = new Point(nw / 2 - 30, FootY + 2);
+            if (scaleDebounceTimer != null)
+            {
+                scaleDebounceTimer.Stop();
+                scaleDebounceTimer.Start();
+            }
 
             if (ringOpen && ringOverlay != null && !ringOverlay.IsDisposed)
             {
