@@ -1064,6 +1064,30 @@ namespace ZhuChong
     }
 
     // =========================================================================
+    // 原生无锯齿、零洋红渗色 PictureBox 渲染控件（杜绝双线性插值导致的洋红半透明残边）
+    // =========================================================================
+    class PetPictureBox : PictureBox
+    {
+        public PetPictureBox()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+        }
+
+        protected override void OnPaint(PaintEventArgs pe)
+        {
+            if (Image == null)
+            {
+                pe.Graphics.Clear(BackColor);
+                return;
+            }
+            pe.Graphics.Clear(BackColor);
+            pe.Graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
+            pe.Graphics.PixelOffsetMode = PixelOffsetMode.Half;
+            pe.Graphics.DrawImage(Image, ClientRectangle);
+        }
+    }
+
+    // =========================================================================
     // 桌宠主体窗体：保持固定尺寸，不随展开而 resize，杜绝黑闪与乱跳
     // =========================================================================
     class PetForm : Form
@@ -1162,7 +1186,7 @@ namespace ZhuChong
 
         Panel bubble;
         Label bubbleText, clockLabel;
-        PictureBox petBox;
+        PetPictureBox petBox;
         public PictureBox PetBox { get { return petBox; } }
         int tomatoLeft = 0; // 番茄钟剩余秒
         Timer tomatoTimer;
@@ -1213,7 +1237,7 @@ namespace ZhuChong
             DoubleBuffered = true;
 
             // 角色显示
-            petBox = new PictureBox
+            petBox = new PetPictureBox
             {
                 BackColor = Color.Magenta,
                 Size = new Size(Nw, PetH),
