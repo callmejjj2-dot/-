@@ -14,6 +14,7 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using System.Xml;
 using Timer = System.Windows.Forms.Timer;
@@ -1081,8 +1082,8 @@ namespace ZhuChong
                 return;
             }
             pe.Graphics.Clear(BackColor);
-            pe.Graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
-            pe.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            pe.Graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
+            pe.Graphics.PixelOffsetMode = PixelOffsetMode.Half;
             pe.Graphics.DrawImage(Image, ClientRectangle);
         }
     }
@@ -1132,7 +1133,10 @@ namespace ZhuChong
         bool isCheckingUpdate = false;
         // 自动动作检测
         Timer autoTimer;
-        Timer scaleDebounceTimer;
+        Timer gifReloadTimer;
+        readonly Stopwatch gifReloadDelay = new Stopwatch();
+        Task<Dictionary<string, GifClip>> gifReloadTask;
+        int gifRequestVersion, gifLoadingVersion;
         IntPtr kbHook = IntPtr.Zero;
         LowLevelKeyboardProc kbProc;
         DateTime lastKeyTime = DateTime.MinValue;
@@ -1201,7 +1205,6 @@ namespace ZhuChong
         public int Nh { get { return Math.Max(200, (int)(430 * PetScale)); } }
         public int FootY { get { return Math.Max(180, (int)(400 * PetScale)); } }
         public int PetH { get { return Math.Max(140, (int)(320 * PetScale)); } }
-        const int MID_H = 480;               // GIF 帧缓存中间高度，播放时按 PetScale 再缩放
 
         public PetForm()
         {
@@ -1221,14 +1224,9 @@ namespace ZhuChong
             cfgPath = Path.Combine(cfgDir, "config.xml");
 
             LoadConfig();
-                        scaleDebounceTimer = new Timer { Interval = 350 };
-            scaleDebounceTimer.Tick += (se, ea) =>
-            {
-                scaleDebounceTimer.Stop();
-                LoadGifs();
-                PlayFrame();
-            };
-            LoadGifs();
+            clips = LoadGifs(PetH, outlineOn);
+            gifReloadTimer = new Timer { Interval = 50 };
+            gifReloadTimer.Tick += (s, e) => ProcessGifReload();
 
             // 窗体
             Text = "桌宠";
@@ -1369,11 +1367,11 @@ namespace ZhuChong
                     audioViz.Show();
                     audioViz.Start();
                 }
-                CleanupOldUpdateBackup();
                 foreach (string a in Environment.GetCommandLineArgs())
                 {
                     if (a == "--updated")
                     {
+                        CleanupOldUpdateBackup();
                         ShowBubble("✨ 已通过 GitHub 自动同步至最新版本！", 4000);
                         break;
                     }
@@ -1397,6 +1395,7 @@ namespace ZhuChong
         // ---------- 配置持久化 ----------
         void LoadConfig()
         {
+            LoadDefaultUpdateUrl();
             try
             {
                 if (!File.Exists(cfgPath)) return;
@@ -1410,7 +1409,7 @@ namespace ZhuChong
                 audioVizOn = GetXml(root, "audioViz", "1") != "0";
                 fullscreenHide = GetXml(root, "fullscreenHide", "0") != "0";
                 autoUpdateOn = GetXml(root, "autoUpdate", "1") != "0";
-                updateUrl = GetXml(root, "updateUrl", "").Trim();
+                updateUrl = NormalizeGitHubRawUrl(GetXml(root, "updateUrl", updateUrl));
                 city = GetXml(root, "city", "changzhou");
 
                 icons.Clear();
@@ -1463,7 +1462,6 @@ namespace ZhuChong
                 }
             }
             catch { }
-            LoadUpdateUrlFromFileIfEmpty();
         }
 
         static int IntXml(XmlNode n, string name, int def)
@@ -1562,66 +1560,106 @@ namespace ZhuChong
             n.AppendChild(c);
         }
 
-                // ---------- 高清抗锯齿帧边缘净化（彻底杜绝洋红渗色、黑点噪点与马赛克） ----------
-        static void CleanBicubicFrame(Bitmap bmp)
+        // WinForms 的透明键要求背景为单一颜色。描边只占用紧邻角色的背景像素。
+        static void CleanBicubicFrame(Bitmap bmp, bool showOutline)
         {
             int w = bmp.Width, h = bmp.Height;
             var data = bmp.LockBits(new Rectangle(0, 0, w, h),
                 ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
-            int bytes = data.Stride * h;
-            var buf = new byte[bytes];
-            Marshal.Copy(data.Scan0, buf, 0, bytes);
-
-            for (int y = 0; y < h; y++)
+            try
             {
-                int row = y * data.Stride;
-                for (int x = 0; x < w; x++)
+                const int alphaThreshold = 120;
+                int stride = data.Stride;
+                var buf = new byte[stride * h];
+                Marshal.Copy(data.Scan0, buf, 0, buf.Length);
+                bool[] opaque = null;
+                if (showOutline)
                 {
-                    int i = row + x * 4;
-                    byte a = buf[i + 3];
-                    if (a < 120)
+                    opaque = new bool[w * h];
+                    for (int y = 0; y < h; y++)
+                        for (int x = 0; x < w; x++)
+                            opaque[y * w + x] = buf[y * stride + x * 4 + 3] >= alphaThreshold;
+                }
+
+                for (int y = 0; y < h; y++)
+                {
+                    for (int x = 0; x < w; x++)
                     {
-                        // 彻底置为纯洋红 (255, 0, 255)，供 Windows TransparencyKey 100% 精确穿透，绝不留半点洋红描边
-                        buf[i] = 255;     // B
-                        buf[i + 1] = 0;   // G
-                        buf[i + 2] = 255; // R
-                        buf[i + 3] = 255; // A
-                    }
-                    else
-                    {
-                        // 逆预乘 Alpha 恢复角色边缘真实色彩，消除双三次插值边缘采样黑色产生的暗斑与黑点
-                        if (a < 255 && a > 0)
+                        int i = y * stride + x * 4;
+                        if (buf[i + 3] < alphaThreshold)
                         {
-                            int invA = 255 * 255 / a;
-                            int b = (buf[i] * invA) / 255;
-                            int g = (buf[i + 1] * invA) / 255;
-                            int r = (buf[i + 2] * invA) / 255;
-                            buf[i] = (byte)(b > 255 ? 255 : b);
-                            buf[i + 1] = (byte)(g > 255 ? 255 : g);
-                            buf[i + 2] = (byte)(r > 255 ? 255 : r);
+                            int pixel = y * w + x;
+                            bool edge = opaque != null &&
+                                ((x > 0 && opaque[pixel - 1]) || (x + 1 < w && opaque[pixel + 1]) ||
+                                 (y > 0 && opaque[pixel - w]) || (y + 1 < h && opaque[pixel + w]));
+                            buf[i] = edge ? (byte)72 : (byte)255;
+                            buf[i + 1] = edge ? (byte)42 : (byte)0;
+                            buf[i + 2] = edge ? (byte)58 : (byte)255;
                         }
+                        else if (buf[i] == 255 && buf[i + 1] == 0 && buf[i + 2] == 255)
+                            buf[i] = 254;
                         buf[i + 3] = 255;
                     }
                 }
+                Marshal.Copy(buf, 0, data.Scan0, buf.Length);
             }
-
-            Marshal.Copy(buf, 0, data.Scan0, bytes);
-            bmp.UnlockBits(data);
+            finally { bmp.UnlockBits(data); }
         }
 
-        void LoadGifs()
+        static void DisposeGifFrames(Dictionary<string, GifClip> animations)
         {
-            if (petBox != null) petBox.Image = null;
-            // 先释放旧 GIF 帧，防止重加载时内存泄漏
-            foreach (var oldClip in clips.Values)
-            {
-                foreach (var f in oldClip.Frames) f.Dispose();
-                oldClip.Frames.Clear();
-            }
-            clips.Clear();
+            foreach (var clip in animations.Values)
+                foreach (var frame in clip.Frames)
+                    frame.Dispose();
+            animations.Clear();
+        }
 
-            // 加载所有GIF模式（在加载阶段直接缩放至显示尺寸 PetH 并完成边缘去半透明处理，立即释放原始大图，内存占用降低约 85%~90%）
+        void QueueGifReload()
+        {
+            gifRequestVersion++;
+            gifReloadDelay.Restart();
+            gifReloadTimer.Start();
+        }
+
+        void ProcessGifReload()
+        {
+            if (gifReloadTask != null)
+            {
+                if (!gifReloadTask.IsCompleted) return;
+                var completed = gifReloadTask;
+                gifReloadTask = null;
+                if (completed.Status == TaskStatus.RanToCompletion)
+                {
+                    var result = completed.Result;
+                    if (gifLoadingVersion == gifRequestVersion && result.Count > 0)
+                    {
+                        if (petBox != null) petBox.Image = null;
+                        DisposeGifFrames(clips);
+                        clips = result;
+                        PlayFrame();
+                    }
+                    else DisposeGifFrames(result);
+                }
+                else Debug.WriteLine(completed.Exception);
+
+                if (gifLoadingVersion == gifRequestVersion)
+                {
+                    gifReloadTimer.Stop();
+                    return;
+                }
+            }
+
+            if (gifReloadDelay.ElapsedMilliseconds < 350) return;
+            gifLoadingVersion = gifRequestVersion;
             int targetH = PetH;
+            bool removeOutline = outlineOn;
+            gifReloadTask = Task.Factory.StartNew(() => LoadGifs(targetH, removeOutline),
+                CancellationToken.None, TaskCreationOptions.None, TaskScheduler.Default);
+        }
+
+        Dictionary<string, GifClip> LoadGifs(int targetH, bool removeOutline)
+        {
+            var loaded = new Dictionary<string, GifClip>();
             var gifMap = new Dictionary<string, string[]>
             {
                 { "idle", new string[] { "待机.gif", "idle.gif" } },
@@ -1658,6 +1696,7 @@ namespace ZhuChong
                     if (path != null) break;
                 }
                 if (path == null) continue;
+                var clip = new GifClip();
                 try
                 {
                     using (var img = Image.FromFile(path))
@@ -1677,11 +1716,11 @@ namespace ZhuChong
 
                         int dh = targetH;
                         int dw = Math.Max(10, (int)((long)img.Width * dh / img.Height));
-                        var clip = new GifClip();
                         for (int i = 0; i < n; i++)
                         {
                             img.SelectActiveFrame(dim, i);
                             var scaled = new Bitmap(dw, dh, PixelFormat.Format32bppArgb);
+                            clip.Frames.Add(scaled);
                             using (var g = Graphics.FromImage(scaled))
                             {
                                 g.Clear(Color.Transparent);
@@ -1689,26 +1728,26 @@ namespace ZhuChong
                                 g.PixelOffsetMode = PixelOffsetMode.HighQuality;
                                 g.DrawImage(img, 0, 0, dw, dh);
                             }
-                            CleanBicubicFrame(scaled);
-                            clip.Frames.Add(scaled);
+                            CleanBicubicFrame(scaled, !removeOutline);
 
                             int d = 100;
                             if (delayBytes != null && delayBytes.Length >= (i + 1) * 4)
                             {
-                                int v = BitConverter.ToInt32(delayBytes, i * 4);
-                                d = Math.Max(10, v * 10);
+                                uint v = BitConverter.ToUInt32(delayBytes, i * 4);
+                                d = (int)Math.Max(10L, Math.Min(int.MaxValue, v * 10L));
                             }
                             clip.Delays.Add(d);
                         }
-                        clips[m] = clip;
+                        loaded[m] = clip;
                     }
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    foreach (var frame in clip.Frames) frame.Dispose();
+                    Debug.WriteLine(ex);
+                }
             }
-            // 主动触发垃圾回收，立即归还解码过程中的大对象堆内存
-            GC.Collect();
-            GC.WaitForPendingFinalizers();
-            GC.Collect();
+            return loaded;
         }
 
         // ---------- 动画播放 ----------
@@ -1757,7 +1796,7 @@ namespace ZhuChong
 
             frameIdx++;
             int d = clip.Delays[frameIdx - 1];
-            if (d >= 30) { animTimer.Interval = d; }
+            animTimer.Interval = d;
         }
 
         // ---------- 走路 ----------
@@ -2123,7 +2162,8 @@ namespace ZhuChong
             outlineOn = !outlineOn;
             SaveConfig();
             BuildMenu();
-            ShowBubble(outlineOn ? "✨ 当前为原生透明高清模式" : "✨ 当前为原生透明标准模式", 2000);
+            QueueGifReload();
+            ShowBubble(outlineOn ? "✨ 已隐藏边缘描边" : "✨ 已显示边缘描边", 2000);
         }
 
         void ToggleAudioViz()
@@ -2723,7 +2763,7 @@ namespace ZhuChong
         }
 
         // ---------- GitHub 直链多设备自动同步更新 ----------
-        void LoadUpdateUrlFromFileIfEmpty()
+        void LoadDefaultUpdateUrl()
         {
             try
             {
@@ -2815,16 +2855,9 @@ namespace ZhuChong
 
         void CleanupOldUpdateBackup()
         {
-            ThreadPool.QueueUserWorkItem(state =>
-            {
-                Thread.Sleep(2000);
-                try
-                {
-                    string bak = Application.ExecutablePath + ".bak";
-                    if (File.Exists(bak)) File.Delete(bak);
-                }
-                catch { }
-            });
+            try { File.Delete(Application.ExecutablePath + ".bak"); }
+            catch (IOException ex) { Debug.WriteLine(ex); }
+            catch (UnauthorizedAccessException ex) { Debug.WriteLine(ex); }
         }
 
         static string ComputeBytesSha256(byte[] data)
@@ -3007,22 +3040,59 @@ namespace ZhuChong
             }
         }
 
-        void ApplyNewExeAndRestart(string newExePath)
+        static void ReplaceExecutable(string curExe, string newExePath, Action restart)
         {
-            string curExe = Application.ExecutablePath;
+            if (!File.Exists(newExePath))
+                throw new FileNotFoundException("更新文件不存在。", newExePath);
+
             string bakExe = curExe + ".bak";
+            File.Delete(bakExe);
+            File.Move(curExe, bakExe);
+            bool replaced = false;
             try
             {
-                if (File.Exists(bakExe)) File.Delete(bakExe);
+                File.Move(newExePath, curExe);
+                replaced = true;
+                restart();
             }
-            catch { }
+            catch (Exception updateError)
+            {
+                try
+                {
+                    if (replaced) File.Move(curExe, newExePath);
+                    File.Move(bakExe, curExe);
+                }
+                catch (Exception restoreError)
+                {
+                    throw new IOException("恢复原程序失败，备份位置：" + bakExe,
+                        new AggregateException(updateError, restoreError));
+                }
+                throw;
+            }
+        }
 
-            // Windows 允许直接将正在运行的自身 .exe 重命名为 .bak，再将新 .exe 移入原路径并直接拉起
-            File.Move(curExe, bakExe);
-            File.Move(newExePath, curExe);
-
+        void ApplyNewExeAndRestart(string newExePath, string csText, string sourceHash)
+        {
+            string curExe = Application.ExecutablePath;
             SaveConfig();
-            Process.Start(new ProcessStartInfo(curExe, "--updated") { WorkingDirectory = baseDir });
+            ReplaceExecutable(curExe, newExePath, () =>
+            {
+                using (var process = Process.Start(new ProcessStartInfo(curExe, "--updated") { WorkingDirectory = baseDir }))
+                {
+                    if (process == null) throw new InvalidOperationException("无法启动更新后的桌宠。");
+                }
+            });
+
+            if (csText != null)
+            {
+                try
+                {
+                    string localCs = Path.Combine(baseDir, "PetApp.cs");
+                    if (File.Exists(localCs)) File.WriteAllText(localCs, csText, new UTF8Encoding(true));
+                }
+                catch (Exception ex) { Debug.WriteLine(ex); }
+                SaveLocalCurrentCsHash(sourceHash);
+            }
             Application.Exit();
         }
 
@@ -3049,46 +3119,31 @@ namespace ZhuChong
 
             ThreadPool.QueueUserWorkItem(state =>
             {
+                string newExePath = Path.Combine(baseDir, "update_" + Guid.NewGuid().ToString("N") + ".exe");
+                string csText = null;
+                string sourceHash = null;
+                Exception checkError = null;
+                bool updateReady = false;
                 try
                 {
                     byte[] rawBytes = DownloadWithGitHubFallback(targetUrl);
                     string cleanPath = targetUrl.Split('?')[0].ToLowerInvariant();
-                    string newExePath = Path.Combine(baseDir, "update_new.exe");
 
                     if (cleanPath.EndsWith(".cs"))
                     {
-                        string csText = Encoding.UTF8.GetString(rawBytes).TrimStart('\uFEFF');
+                        csText = Encoding.UTF8.GetString(rawBytes).TrimStart('\uFEFF');
                         if (!csText.Contains("namespace ZhuChong") || !csText.Contains("class PetForm"))
                         {
                             throw new Exception("下载的不是有效的 PetApp.cs 源码文件");
                         }
-                        string remoteHash = ComputeNormalizedCsHash(csText);
-                        string localHash = GetLocalCurrentCsHash();
-                        if (!string.IsNullOrEmpty(localHash) && string.Equals(remoteHash, localHash, StringComparison.OrdinalIgnoreCase))
+                        sourceHash = ComputeNormalizedCsHash(csText);
+                        if (!string.Equals(sourceHash, GetLocalCurrentCsHash(), StringComparison.OrdinalIgnoreCase))
                         {
-                            if (manualNotify)
-                            {
-                                BeginInvoke(new Action(() => ShowBubble("✅ 当前已是 GitHub 最新版本！", 3000)));
-                            }
-                            return;
+                            string err;
+                            if (!CompileCsToNewExe(csText, newExePath, out err))
+                                throw new InvalidOperationException(err);
+                            updateReady = true;
                         }
-
-                        BeginInvoke(new Action(() => ShowBubble("✨ 发现 GitHub 新版本源码，正在后台编译更新…", 4000)));
-                        string err;
-                        if (!CompileCsToNewExe(csText, newExePath, out err))
-                        {
-                            throw new Exception(err);
-                        }
-                        // 同步更新本地源码文件与版本哈希记录
-                        try
-                        {
-                            string localCs = Path.Combine(baseDir, "PetApp.cs");
-                            if (File.Exists(localCs)) File.WriteAllText(localCs, csText, new UTF8Encoding(true));
-                        }
-                        catch { }
-                        SaveLocalCurrentCsHash(remoteHash);
-
-                        BeginInvoke(new Action(() => ApplyNewExeAndRestart(newExePath)));
                     }
                     else
                     {
@@ -3099,33 +3154,41 @@ namespace ZhuChong
                         }
                         string remoteHash = ComputeBytesSha256(rawBytes);
                         string localHash = ComputeBytesSha256(File.ReadAllBytes(Application.ExecutablePath));
-                        if (string.Equals(remoteHash, localHash, StringComparison.OrdinalIgnoreCase))
+                        if (!string.Equals(remoteHash, localHash, StringComparison.OrdinalIgnoreCase))
                         {
-                            if (manualNotify)
-                            {
-                                BeginInvoke(new Action(() => ShowBubble("✅ 当前已是 GitHub 最新版本！", 3000)));
-                            }
-                            return;
+                            File.WriteAllBytes(newExePath, rawBytes);
+                            updateReady = true;
                         }
+                    }
+                }
+                catch (Exception ex) { checkError = ex; }
 
-                        File.WriteAllBytes(newExePath, rawBytes);
-                        BeginInvoke(new Action(() =>
-                        {
-                            ShowBubble("✨ 已下载 GitHub 新版本，正在重启应用更新…", 2500);
-                            ApplyNewExeAndRestart(newExePath);
-                        }));
-                    }
-                }
-                catch (Exception ex)
+                try
                 {
-                    if (manualNotify)
+                    Invoke(new Action(() =>
                     {
-                        BeginInvoke(new Action(() => ShowBubble("更新检查失败：" + ex.Message, 4000)));
-                    }
+                        try
+                        {
+                            if (checkError != null)
+                            {
+                                if (manualNotify) ShowBubble("更新检查失败：" + checkError.Message, 4000);
+                            }
+                            else if (updateReady)
+                            {
+                                if (updateUrl == targetUrl && (manualNotify || autoUpdateOn))
+                                    ApplyNewExeAndRestart(newExePath, csText, sourceHash);
+                            }
+                            else if (manualNotify) ShowBubble("✅ 当前已是 GitHub 最新版本！", 3000);
+                        }
+                        catch (Exception ex) { ShowBubble("安装更新失败：" + ex.Message, 5000); }
+                        finally { isCheckingUpdate = false; }
+                    }));
                 }
+                catch (InvalidOperationException ex) { Debug.WriteLine(ex); }
                 finally
                 {
-                    isCheckingUpdate = false;
+                    try { File.Delete(newExePath); }
+                    catch (Exception ex) { Debug.WriteLine(ex); }
                 }
             });
         }
@@ -3164,6 +3227,16 @@ namespace ZhuChong
                 if (walkTimer != null) { walkTimer.Dispose(); walkTimer = null; }
                 if (clockTimer != null) { clockTimer.Dispose(); clockTimer = null; }
                 if (idleTimer != null) { idleTimer.Dispose(); idleTimer = null; }
+                if (gifReloadTimer != null) { gifReloadTimer.Dispose(); gifReloadTimer = null; }
+                if (gifReloadTask != null)
+                {
+                    gifReloadTask.ContinueWith(completed =>
+                    {
+                        if (completed.Status == TaskStatus.RanToCompletion) DisposeGifFrames(completed.Result);
+                        else Debug.WriteLine(completed.Exception);
+                    }, TaskScheduler.Default);
+                    gifReloadTask = null;
+                }
                 if (tomatoTimer != null) { tomatoTimer.Dispose(); tomatoTimer = null; }
                 if (fsTimer != null) { fsTimer.Dispose(); fsTimer = null; }
                 if (autoTimer != null) { autoTimer.Dispose(); autoTimer = null; }
@@ -3173,12 +3246,7 @@ namespace ZhuChong
                 if (kbHook != IntPtr.Zero) { UnhookWindowsHookEx(kbHook); kbHook = IntPtr.Zero; }
                 if (ringOverlay != null && !ringOverlay.IsDisposed) { ringOverlay.Dispose(); ringOverlay = null; }
                 if (audioViz != null && !audioViz.IsDisposed) { audioViz.Dispose(); audioViz = null; }
-                foreach (var c in clips.Values)
-                {
-                    foreach (var f in c.Frames) f.Dispose();
-                    c.Frames.Clear();
-                }
-                clips.Clear();
+                DisposeGifFrames(clips);
             }
             base.Dispose(disposing);
         }
@@ -3216,10 +3284,10 @@ namespace ZhuChong
         {
             if (s < 0.4) s = 0.4;
             if (s > 2.0) s = 2.0;
-            if (Math.Abs(s - PetScale) < 0.01) return;
-            double oldScale = PetScale;
+            if (s == PetScale) return;
+            int oldFootScreen = Location.Y + FootY;
+            int oldPetHeight = PetH;
             PetScale = s;
-            int oldFootScreen = Location.Y + (int)(400 * oldScale);
             int nw = Nw, nh = Nh;
             int y = oldFootScreen - FootY;
             SetBounds(Location.X + (Width - nw) / 2, y, nw, nh);
@@ -3233,11 +3301,7 @@ namespace ZhuChong
             }
             clockLabel.Location = new Point(nw / 2, FootY + 2);
             tomatoLabel.Location = new Point(nw / 2 - 30, FootY + 2);
-            if (scaleDebounceTimer != null)
-            {
-                scaleDebounceTimer.Stop();
-                scaleDebounceTimer.Start();
-            }
+            if (PetH != oldPetHeight) QueueGifReload();
 
             if (ringOpen && ringOverlay != null && !ringOverlay.IsDisposed)
             {
